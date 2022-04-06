@@ -1,0 +1,13 @@
+<?php
+/**
+ * @file
+ * Sets default values for salesforce_login.
+ */
+
+/**
+ * Delete variables salesforce_login_multiple_contacts_error and salesforce_login_no_contact_found_error.
+ */
+function salesforce_login_update_7001() {
+  variable_del('salesforce_login_multiple_contacts_error');
+  variable_del('salesforce_login_no_contact_found_error');
+}

@@ -1,0 +1,495 @@
+<?php
+/**
+ * @file
+ * Provides support from creating new Drupal users from Salesforce contacts.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function salesforce_login_menu() {
+  // Settings form.
+  $items['admin/config/salesforce/salesforce-login'] = array(
+    'title' => 'Salesforce Login',
+    'description' => 'Configuration settings for Salesforce Login.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('salesforce_login_admin_form'),
+    'access arguments' => array('administer salesforce login'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'salesforce_login.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function salesforce_login_permission() {
+  return array(
+    'administer salesforce login' => array(
+      'description' => t('Configure settings for creating Drupal users from Salesforce.'),
+      'title' => t('Configure Salesforce Login'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function salesforce_login_form_user_pass_alter(&$form, $form_state, $form_id) {
+  // Search for and replace the user_pass_validate() and user_pass_submit()
+  // callbacks with our own.
+  $form['#validate'] = str_replace('user_pass_validate', 'salesforce_login_pass_validate', $form['#validate']);
+  $form['#submit'] = str_replace('user_pass_submit', 'salesforce_login_pass_submit', $form['#submit']);
+}
+
+/**
+ * Submit handler.
+ *
+ * This function is adapted from and overrides user_pass_submit(). This is done
+ * in order to send the account activation email (rather than the password
+ * recovery email) when a new user is created from a Salesforce Contact.
+ */
+function salesforce_login_pass_submit($form, &$form_state) {
+  global $language;
+
+  if (isset($form_state['values']['salesforce_login_created_account'])) {
+    $account = $form_state['values']['account'];
+    // Mail one time login URL and instructions using current language.
+    $mail = _user_mail_notify('status_activated', $account, $language);
+    if (!empty($mail)) {
+      watchdog('salesforce_login', 'Account activation instructions mailed to %name at %email.', array('%name' => $account->name, '%email' => $account->mail));
+    }
+  }
+  else {
+    if (isset($form_state['values']['account'])) {
+      $account = $form_state['values']['account'];
+      // Mail one time login URL and instructions using current language.
+      $mail = _user_mail_notify('password_reset', $account, $language);
+      if (!empty($mail)) {
+        watchdog('salesforce_login', 'Password reset instructions mailed to %name at %email.', array('%name' => $account->name, '%email' => $account->mail));
+      }
+    }
+    else {
+      watchdog('salesforce_login', 'Password reset form was submitted with an unknown or inactive account: %name.', array('%name' => $form_state['values']['name']));
+    }
+  }
+
+  $password_reset_text = variable_get('user_password_reset_text', t('If %identifier is a valid account, an email will be sent with instructions to reset your password.'));
+  drupal_set_message(format_string($password_reset_text, array('%identifier' => $form_state['values']['name'])));
+  $form_state['redirect'] = 'user';
+  return;
+}
+
+/**
+ * Validation handler.
+ *
+ * @see user_pass_validate().
+ *
+ * This function is adapted from and overrides user_pass_validate(). If no
+ * Drupal user is found, Salesforce is queried and a corresponding Drupal user
+ * created on success.
+ */
+function salesforce_login_pass_validate($form, &$form_state) {
+  if (isset($form_state['values']['name']) && !is_scalar($form_state['values']['name'])) {
+    form_set_error('name', t('An illegal value has been detected. Please contact the site administrator.'));
+    return;
+  }
+  $user_pass_reset_ip_window = variable_get('user_pass_reset_ip_window', 3600);
+  // Do not allow any password reset from the current user's IP if the limit
+  // has been reached. Default is 50 attempts allowed in one hour. This is
+  // independent of the per-user limit to catch attempts from one IP to request
+  // resets for many different user accounts. We have a reasonably high limit
+  // since there may be only one apparent IP for all users at an institution.
+  if (!flood_is_allowed('pass_reset_ip', variable_get('user_pass_reset_ip_limit', 50), $user_pass_reset_ip_window)) {
+    form_set_error('name', t('Sorry, too many password reset attempts from your IP address. This IP address is temporarily blocked. Try again later or <a href="@url">request a new password</a>.', array('@url' => url('user/password'))));
+    return;
+  }
+  // Always register an per-IP event.
+  flood_register_event('pass_reset_ip', $user_pass_reset_ip_window);
+  $name = trim($form_state['values']['name']);
+  if (!empty($name)) {
+    // Try to load by email.
+    $users = user_load_multiple(array(), array('mail' => $name, 'status' => '1'));
+    $account = reset($users);
+    if (!$account) {
+      // No success, try to load by name.
+      $users = user_load_multiple(array(), array('name' => $name, 'status' => '1'));
+      $account = reset($users);
+    }
+  }
+  if (isset($account->uid)) {
+    // Register user flood events based on the uid only, so they can be cleared
+    // when a password is reset successfully.
+    $identifier = $account->uid;
+    $user_pass_reset_user_window = variable_get('user_pass_reset_user_window', 21600);
+    $user_pass_reset_user_limit = variable_get('user_pass_reset_user_limit', 5);
+    // Don't allow password reset if the limit for this user has been reached.
+    // Default is to allow 5 passwords resets every 6 hours.
+    if (!flood_is_allowed('pass_reset_user', $user_pass_reset_user_limit, $user_pass_reset_user_window, $identifier)) {
+      form_set_error('name', format_plural($user_pass_reset_user_limit, 'Sorry, there has been more than one password reset attempt for this account. It is temporarily blocked. Try again later or <a href="@url">login with your password</a>.', 'Sorry, there have been more than @count password reset attempts for this account. It is temporarily blocked. Try again later or <a href="@url">login with your password</a>.', array('@url' => url('user/login'))));
+      return;
+    }
+    // Register a per-user event.
+    flood_register_event('pass_reset_user', $user_pass_reset_user_window, $identifier);
+    form_set_value(array('#parents' => array('account')), $account, $form_state);
+
+    // Support for sbg_profile.module. If the existing Drupal user doesn't
+    // have a profile for the current domain/group, it doesn't count so NULL it.
+    drupal_alter('salesforce_login_loaded_drupal_account', $account);
+    if (!isset($account->uid)) {
+      //form_set_error('name', variable_get('salesforce_login_no_contact_found_error'));
+      return;
+    }
+
+    // Query salesforce_sync_map for Contact and Account.
+    $result = db_query('SELECT drupal_id, sfid, object_type FROM {salesforce_sync_map} WHERE object_type IN (:object_types) AND drupal_id = :uid',
+    array(':object_types' => array('Contact', 'Account'), ':uid' => $account->uid))->fetchAll();
+
+    // Support for sbg_profile.module.
+    drupal_alter('salesforce_login_sync_map', $result, $account->uid);
+
+    // Nothing found, query SF by email.
+    if(!$result) {
+      $contacts = salesforce_login_get_contacts_by_email($name);
+      // If a Contact found, create sync map.
+      if (count($contacts) == 1) {
+        // Save salesforce_sync_map records for Account and Contact immediately
+        // so that My Donation History can be populated with donations before
+        // the next salesforce sync job runs.
+        salesforce_login_sync_map_save($account->uid, $contacts);
+      }
+    }
+  }
+  else {
+    // No Drupal user found. Try Salesforce.
+    if (!valid_email_address($name)) {
+      watchdog('salesforce_login', 'Salesforce query not performed for :name because it is not a valid email address.', array(':name' => $name), WATCHDOG_INFO);
+      return;
+    }
+    $contacts = salesforce_login_get_contacts_by_email($name);
+    if (count($contacts) == 0) {
+      watchdog('salesforce_login', 'No valid SF Contact found for :name', array(':name' => $name), WATCHDOG_INFO);
+    }
+    elseif (count($contacts) == 1) {
+      // One corresponding Contact found in Salesforce. Create Drupal user.
+      $account = salesforce_login_user_save($name, $contacts[0]);
+      if ($account) {
+        $form_state['values']['account'] = $account;
+        $form_state['values']['salesforce_login_created_account'] = TRUE;
+        // Save salesforce_sync_map records for Account and Contact immediately
+        // so that My Donation History can be populated with donations before
+        // the next salesforce sync job runs.
+        salesforce_login_sync_map_save($account->uid, $contacts);
+      }
+      else {
+        // form_set_error('name', t('There was a problem creating your account.'));
+        watchdog('salesforce_login', 'There was a problem creating the account for :name.', array(':name' => $name), WATCHDOG_ERROR);
+
+      }
+    }
+    elseif (count($contacts) > 1) {
+      watchdog('salesforce_login', 'Multiple Salesforce Contacts found for :name so no Springboard user could be created', array(':name' => $name), WATCHDOG_ERROR);
+
+    }
+  }
+}
+
+/**
+ * Creates Drupal user from returned Salesforce Contact.
+ */
+function salesforce_login_user_save($mail, $contact) {
+  $account = new stdClass();
+  $account->is_new = TRUE;
+  $account->name = salesforce_login_cleanup_username($mail);
+  $account->mail = $mail;
+  $account->init = $mail;
+  $account->status = TRUE;
+  $account->data['account_creator'] = 'salesforce_login_user_save';
+  salesforce_login_map_profile_fields($account, $contact);
+
+  if (user_save($account)) {
+    module_invoke_all('salesforce_login_map_profile_fields', $account);
+    return $account;
+  }
+  else {
+    return FALSE;
+  }
+
+}
+
+/**
+ * Return a SF Contact from its Salesforce ID
+ *
+ * The fields returned are determined by the user_to_contact entity mapping.
+ * Only fields configured with "Overwrite rule when importing into Drupal" set
+ * to always will be included.
+ *
+ * @param string $sfid
+ *   A Contact's Salesforce ID.
+ *
+ * @return mixed
+ *   Returns FALSE if no Contact found or a SObject.
+*/
+function salesforce_login_get_contact_by_sfid($sfid) {
+  // Find the Salesforce fields that map to Drupal user fields so we can return
+  // them in the query.
+  $user_to_contact_mapping = salesforce_mapping_load('user_to_contact');
+  drupal_alter('salesforce_login_contact_mapping', $user_to_contact_mapping);
+  $salesforce_fields = array();
+  if (!empty($user_to_contact_mapping)) {
+    foreach ($user_to_contact_mapping->field_mappings as $mapping) {
+      if ($mapping['direction'] == 'sf_drupal') {
+        $salesforce_fields[] = $mapping['salesforce_field']['name'];
+      }
+    }
+  }
+
+  try {
+    $sfapi = salesforce_get_api();
+    $soap = salesforce_get_soap($sfapi);
+    $salesforce_sync = new SalesforceSync($sfapi, $soap);
+    $result = $salesforce_sync->fetchByIds('Contact', $salesforce_fields, array($sfid));
+    if (isset($result[0]) && $result[0] instanceof SObject) {
+      return $result[0];
+    }
+  }
+  catch (Exception $e) {
+    watchdog('salesforce_login', $e->getMessage(), NULL, WATCHDOG_ERROR);
+  }
+  watchdog('salesforce_login', 'No Contact found querying SFID %contact', array('%contact' => $account->salesforce_contact_id), WATCHDOG_DEBUG);
+  return FALSE;
+}
+
+/**
+ * Copies fields from a SF Contact to a Drupal user Profile.
+ *
+ * Mapping comes from the user_to_contact entity mapping. Only fields configured
+ * with "Overwrite rule when importing into Drupal" set to always will be
+ * copied.
+ *
+ */
+function salesforce_login_map_profile_fields(&$account, $contact) {
+  // Get user_to_contact field mapping and save profile field values in
+  // the appropriate places. eg
+  // $account->sbp_address[LANGUAGE_NONE][0]['value'].
+  // $account->sbp_last_name[LANGUAGE_NONE][0]['value'].
+  $user_to_contact_mapping = salesforce_mapping_load('user_to_contact');
+  drupal_alter('salesforce_login_contact_mapping', $user_to_contact_mapping);
+  $mapped_profile_fields_and_values = array();
+  if (!empty($user_to_contact_mapping)) {
+    foreach ($user_to_contact_mapping->field_mappings as $field_mapping) {
+      // Only grab fields that should be synced from Salesforce to Drupal.
+      if ($field_mapping['direction'] == 'sf_drupal') {
+        // Only grab mapped fields returned in the query from Salesforce.
+        if (isset($contact->{$field_mapping['salesforce_field']['name']})) {
+          // We explicitly set $account->mail above, so don't change it here.
+          if ($field_mapping['drupal_field']['fieldmap_value'] != 'mail') {
+            // Special snowflake handling for sbp_address. If mapped, explode
+            // it on newline characters and save the result into sbp_address
+            // and sbp_address_line_2.
+            if ($field_mapping['drupal_field']['fieldmap_value'] == 'sbp_address') {
+              // If MailingStreet returned a value.
+              if (isset($contact->fields->MailingStreet) && !empty($contact->fields->MailingStreet)) {
+                $exploded_address = preg_split("/\\r\\n|\\r|\\n/", $contact->fields->MailingStreet);
+                // sbp_address.
+                if (isset($exploded_address[0]) && !empty($exploded_address[0])) {
+                  $account->sbp_address['und'][0]['value'] = $exploded_address[0];
+                  $mapped_profile_fields_and_values['sbp_address'] = $account->sbp_address['und'][0]['value'];
+                }
+                // sbp_address_line_2.
+                if (isset($exploded_address[1]) && !empty($exploded_address[1])) {
+                  $account->sbp_address_line_2['und'][0]['value'] = $exploded_address[1];
+                  $mapped_profile_fields_and_values['sbp_address_line_2'] = $account->sbp_address_line_2['und'][0]['value'];
+                }
+              }
+            }
+            else {
+              // Convert data types to prevent DB errors.
+              $converted_value = salesforce_login_convert_to_drupal_format($field_mapping['drupal_field']['fieldmap_value'], $contact->{$field_mapping['salesforce_field']['name']});
+              // Add the profile field to the $account object.
+              $account->{$field_mapping['drupal_field']['fieldmap_value']}['und'][0]['value'] = $converted_value;
+              $mapped_profile_fields_and_values[$field_mapping['drupal_field']['fieldmap_value']] = $account->{$field_mapping['drupal_field']['fieldmap_value']}['und'][0]['value'];
+            }
+          }
+        }
+      }
+    }
+    $account->data['mapped_profile_fields_and_values'] = $mapped_profile_fields_and_values;
+  }
+}
+
+/**
+ * Implements hook_user_login().
+*/
+function salesforce_login_user_login(&$edit, $account) {
+  if (variable_get('salesforce_login_copy_profile_fields_on_login', 0)) {
+    if (isset($account->salesforce_contact_id) && !empty($account->salesforce_contact_id)) {
+      $contact = salesforce_login_get_contact_by_sfid($account->salesforce_contact_id);
+      salesforce_login_map_profile_fields($account, $contact);
+      if (user_save($account)) {
+        module_invoke_all('salesforce_login_map_profile_fields', $account);
+        watchdog('salesforce_login', 'Profile fields successfully updated for SB user %user from Salesforce Contact %contact', array('%user' => $account->uid, '%contact' => $account->salesforce_contact_id), WATCHDOG_INFO);
+      }
+       else {
+        watchdog('salesforce_login', 'Failed to update profile fields for SB user %user from Salesforce Contact %contact', array('%user' => $account->uid, '%contact' => $account->salesforce_contact_id), WATCHDOG_ERROR);
+      }
+    }
+  }
+}
+
+/**
+ * Converts SF types to Drupal types to prevent DB exceptions.
+ *
+ * Currently only supports Drupal boolean b/c that is the only type
+ * confirmed to have caused an issue.
+ *
+ * @param string $user_field_name
+ *   Name of the Drupal field.
+ * @param mixed $salesforce_value
+ *   The values that (may) need to be converted.
+ * @return
+ *   The converted value.
+ */
+function salesforce_login_convert_to_drupal_format($user_field_name, $value){
+  // Load default user wrapper to examine the field data types.
+  $user_wrapper = entity_metadata_wrapper('user');
+  $user_property_info = $user_wrapper->getPropertyInfo();
+
+  switch ($user_property_info[$user_field_name]['type']) {
+    case 'boolean':
+      if (is_string($value)) {
+        // An array of string values that are considered TRUE
+        $valid_booleans = array('true', 'yes', '1');
+        // If the value is in the array set it to TRUE
+        if (in_array(strtolower(trim($value)), $valid_booleans)) {
+          $value = TRUE;
+        }
+        // Default to FALSE
+        else {
+          $value = FALSE;
+        }
+      }
+
+      // Convert any value that evaluates to TRUE as 1
+      if ($value) {
+        $value = 1;
+      }
+      else {
+        $value = 0;
+      }
+      break;
+
+      default:
+      break;
+    }
+
+  return $value;
+}
+
+/**
+ * Saves a Drupal UID / Salesforce Contact SFID mapping.
+ */
+function salesforce_login_sync_map_save($uid, $contacts) {
+  if (isset($contacts[0]->fields->AccountId)) {
+    $account_record = array(
+      'sfid' => $contacts[0]->fields->AccountId,
+      'drupal_id' => $uid,
+      'module' => 'user',
+      'delta' => 'user',
+      'object_type' => 'Account',
+    );
+    drupal_alter('salesforce_login_sync_map_save', $account_record);
+    salesforce_sync_save_map($account_record);
+  }
+  if (isset($contacts[0]->fields->Id)) {
+    $contact_record = array(
+      'sfid' => $contacts[0]->fields->Id,
+      'drupal_id' => $uid,
+      'module' => 'user',
+      'delta' => 'user',
+      'object_type' => 'Contact',
+    );
+    drupal_alter('salesforce_login_sync_map_save', $contact_record);
+    salesforce_sync_save_map($contact_record);
+  }
+}
+
+/**
+ * Helper function that queries Salesforce for Contact by email address.
+ *
+ * @param string $email
+ *   Email address to be queried for in Salesforce.
+ *
+ * @return array
+ *   Returns array of Salesforce Objects containing all fields mapped in the
+ *   user_to_contact record of the salesforce_mapping module.
+ */
+function salesforce_login_get_contacts_by_email($email) {
+  // Find the Salesforce fields that map to Drupal user fields so we can return
+  // all those values in the query.
+  $user_to_contact_mapping = salesforce_mapping_load('user_to_contact');
+  drupal_alter('salesforce_login_contact_mapping', $user_to_contact_mapping);
+  $salesforce_fields = array();
+  if (!empty($user_to_contact_mapping)) {
+    foreach ($user_to_contact_mapping->field_mappings as $mapping) {
+      if ($mapping['direction'] == 'sf_drupal') {
+        $salesforce_fields[] = $mapping['salesforce_field']['name'];
+        // Find the Salesforce field that maps to the Drupal's user's mail field.
+      }
+      if ($mapping['drupal_field']['fieldmap_value'] == 'mail') {
+        $salesforce_mail_field = $mapping['salesforce_field']['name'];
+      }
+    }
+  }
+
+  drupal_alter('salesforce_login_sf_fields', $salesforce_fields);
+
+  // Provide opportunity to override the email field that is queried.
+  $salesforce_login_query_field = variable_get('salesforce_login_query_field');
+  if (!empty($salesforce_login_query_field)) {
+    $salesforce_mail_field = $salesforce_login_query_field;
+  }
+
+  // At a minimum, we need an email field and AccountId in the list.
+  if (!in_array($salesforce_mail_field, $salesforce_fields)) {
+    $salesforce_fields[] = $salesforce_mail_field;
+  }
+  if (!in_array('AccountId', $salesforce_fields)) {
+    $salesforce_fields[] = 'AccountId';
+  }
+  $result = array();
+  // Query Salesforce.
+  try {
+    $sfapi = salesforce_get_api();
+    $soap = salesforce_get_soap($sfapi);
+    $salesforce_sync = new SalesforceSync($sfapi, $soap);
+    $result = $salesforce_sync->fetchByField('Contact', $salesforce_fields, $salesforce_mail_field, array($email));
+  }
+  catch (Exception $e) {
+    watchdog('salesforce_login', $e->getMessage(), NULL, WATCHDOG_ERROR);
+  }
+  // Support for sbg_profile.module.
+  drupal_alter('salesforce_login_fetch', $result, $email);
+  return $result;
+}
+
+/**
+ * Clean name using functions from email_registration.module, if present.
+ *
+ * @param string $name
+ *   A dirty username.
+ *
+ * @return string
+ *   A valid and unique username.
+ */
+function salesforce_login_cleanup_username($name) {
+  if (module_exists('email_registration')) {
+    // Strip off everything after the @ sign.
+    $name = preg_replace('/@.*$/', '', $name);
+    $name = email_registration_cleanup_username($name);
+    $name = email_registration_unique_username($name);
+  }
+  return $name;
+}
